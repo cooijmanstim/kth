@@ -1,55 +1,112 @@
 import os.path
+import operator, itertools
 import numpy as np
 import cPickle as pkl
 import h5py
-import Image
+from collections import OrderedDict
+from PIL import Image
 import sys
 import os
 import glob, re
-import cv2
 from StringIO import StringIO
-
-
 from fuel.datasets.hdf5 import H5PYDataset
 
-"""
-Take the 3 jpeg and targets files from the train, subtrain and valid repo
-and create one hdf5 file
-"""
-def create_hdf5(videos, indir) :
+def main():
+    if (len(sys.argv) != 3):
+        print("%s: annotdir indir" % sys.argv[0])
+        sys.exit(1)
 
-    data_path= os.path.join(os.environ['UCF101'], "jpeg_data.hdf5")
-    f = h5py.File(data_path,'w')
-    f.create_group("video_indexes")
-    indexes_data = np.array([])
+    annotdir = sys.argv[1]
+    indir = sys.argv[2]
 
-    for split in ["train", "valid",] :
-        f, index_data = fill_hdf5(f, split, videos[split], indir)
-        indexes_data = np.append(indexes_data, index_data)
+    split = OrderedDict(
+        (which_set, 
+         read_list(os.path.join(annotdir, "%s.txt" % which_set)))
+        for which_set in "train valid test".split())
 
-    print indexes_data
+    create_hdf5(split, indir)
 
-    split_dict = {
-            'train' : {"images": (0, indexes_data[0])},
+def create_hdf5(split, indir):
+    f = h5py.File(os.environ["KTH_JPEG_HDF5"], "w")
+    f.create_group("video_ranges")
 
-            'valid' : {"images": (indexes_data[0], indexes_data[1])},
+    split_dict = {}
+    for which_set, video_names in split.items():
+        f, (a, b) = fill_hdf5(f, which_set, video_names, indir)
+        split_dict[which_set] = OrderedDict(
+            images=(a, b),
+            targets=(a, b))
 
-            # 'subtrain': {"flow_x": (indexes_data[0], indexes_data[1]),
-            #              "flow_y": (indexes_data[0], indexes_data[1]),
-            #              "targets": (indexes_data[0], indexes_data[1])},
+    print split_dict
 
-            # 'valid' : {"flow_x": (indexes_data[1], indexes_data[2]),
-            #            "flow_y": (indexes_data[1], indexes_data[2]),
-            #            "targets": (indexes_data[1] ,indexes_data[2])},
-
-
-            }
-
-    f.attrs['split'] = H5PYDataset.create_split_array(split_dict)
+    f.attrs["split"] = H5PYDataset.create_split_array(split_dict)
     f.flush()
     f.close()
 
-def sort_by_numbers_in_file_name(list_of_file_names):
+def fill_hdf5(f, which_set, video_names, indir):
+    # store all videos' frames in sequence
+    all_images = []
+    # replicating the target for each video across its frames makes
+    # life involving H5PYDataset much easier
+    all_targets = []
+
+    video_boundaries = [0]
+    for i, video_name in enumerate(video_names):
+        globexpr = os.path.join(indir, video_name, "*.jpeg")
+        print i, indir, video_name, globexpr
+        images = glob.glob(globexpr)
+        if not images:
+            raise RuntimeError("no images match %s" % globexpr)
+        images = natural_sort(images)[::-1]
+        all_images.extend(images)
+        all_targets.extend(len(images) * [infer_target(video_name)])
+        video_boundaries.append(len(all_images))
+
+    n_images = len(all_images)
+
+    # grow hdf5 tables
+    for key, dtype in zip("images targets".split(),
+                          (h5py.special_dtype(vlen=np.uint8), np.uint8)):
+        if key in f:
+            f[key].resize(len(f[key]) + n_images, axis=0)
+        else:
+            f.create_dataset(key, (n_images,),
+                             dtype=dtype, maxshape=(None,))
+
+    # insert data
+    f["images"][-n_images:] = list(map(load_frame, all_images))
+    f["targets"][-n_images:] = all_targets
+
+    # store videos by referring to ranges of images
+    video_ranges = f["video_ranges"].create_dataset(
+        which_set, (len(video_names), 2), dtype="uint32")
+    # note video_ranges are relative to which_set
+    video_ranges[:, :] = np.array(zip(video_boundaries[:-1], video_boundaries[1:]))
+
+    # note what range of images and targets corresponds to the subset
+    # of the data we just processed
+    a, b = len(f["images"]) - n_images, len(f["images"])
+    return f, (a, b)
+
+def load_frame(path):
+    # we store the images as jpeg and do the decompression on the fly.
+    data = StringIO()
+    Image.open(path).convert("L").save(data, format="JPEG")
+    data.seek(0)
+    return np.fromstring(data.read(), dtype="uint8")
+
+labels = dict(
+    (label, code) for code, label in
+    enumerate("boxing handclapping handwaving jogging running walking".split()))
+def infer_target(video_name):
+    key = video_name.split("_")[1]
+    return labels[key]
+
+def read_list(filename):
+    with open(filename) as fp:
+        return list(map(operator.methodcaller("strip"), fp))
+
+def natural_sort(xs):
     def tryint(s):
         try:
             return int(s)
@@ -59,96 +116,9 @@ def sort_by_numbers_in_file_name(list_of_file_names):
         """ Turn a string into a list of string and number chunks.
         "z23a" -> ["z", 23, "a"]
         """
-        return [ tryint(c) for c in re.split('(\-?[0-9]+)', s) ]
-    def sort_nicely(l):
-        """ Sort the given list in the way that humans expect.
-        """
-        l.sort(key=alphanum_key)
-        return l
-
-    return sort_nicely(list_of_file_names)
-
-
-def fill_hdf5(f, split_name, videos, indir) :
-
-
-    video_indexes = f["video_indexes"].create_dataset(split_name,
-                                                      (len(videos),),
-                                                      dtype="uint32")
-    frames_list = []
-    flow_y_list = []
-    totimg = 0
-    for i, filename in enumerate(videos):
-
-        print i, filename, indir+'/', filename
-
-        ### Get all jpeg
-        filename = os.path.join(indir+'/',filename)
-        frames = glob.glob(filename+'/*.jpeg')
-        try:
-            assert frames != []
-        except Exception, e:
-            print "Error with ", filename, ": no images found"
-            exit(1)
-        frames = sort_by_numbers_in_file_name(frames)[::-1]
-
-        totimg += len(frames)
-        video_indexes[i] = totimg
-        frames_list.append(frames)
-
-
-
-    dt_frames = h5py.special_dtype(vlen=np.uint8)
-    try :
-        frames_dtset = f["images"]
-        prev_set_len = len(frames_dtset)
-        frames_dtset.resize(prev_set_len+totimg, axis=0)
-        index = prev_set_len-1
-    except KeyError :
-        frames_dtset = f.create_dataset("images", (totimg,),
-                                        dtype=dt_frames,
-                                        maxshape=(None,))
-        index = 0
-
-    for i in xrange(len(frames_list)) :
-        print "Process", i, "/", len(frames_list)
-        for j in xrange(len(frames_list[i])) :
-            ## frames
-            pic = Image.open(frames_list[i][j])
-            pic = pic.convert('L')
-            data = StringIO()
-            pic.save(data, format="JPEG")
-            data.seek(0)
-            data = data.read()
-            img = np.fromstring(data, dtype='uint8')
-            frames_dtset[index] = img
-            index += 1
-
-    #return hdf5 file, split index for images
-    return f, index
-
-def read_list(filename):
-    l = []
-    with open(filename) as fp:
-        for line in fp:
-            print line.strip()
-            l.append(line.strip())
-
-    return l
-
+        return list(map(tryint, re.split("(\-?[0-9]+)", s)))
+    xs.sort(key=alphanum_key)
+    return xs
 
 if __name__ == "__main__":
-
-    if (len(sys.argv) != 3):
-        print("%s: annotdir indir" % sys.argv[0])
-        exit(1)
-
-
-    annotdir = sys.argv[1]
-    indir = sys.argv[2]
-
-    videos = {}
-    videos['train'] = read_list(annotdir + "/train.txt")
-    videos['valid'] = read_list(annotdir + "/valid.txt")
-
-    create_hdf5(videos, indir)
+    main()
