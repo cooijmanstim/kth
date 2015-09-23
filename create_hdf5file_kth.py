@@ -19,77 +19,58 @@ def main():
     annotdir = sys.argv[1]
     indir = sys.argv[2]
 
-    split = OrderedDict(
+    video_names_by_set = OrderedDict(
         (which_set, 
          read_list(os.path.join(annotdir, "%s.txt" % which_set)))
         for which_set in "train valid test".split())
 
-    create_hdf5(split, indir)
+    split_boundaries = [0] + list(map(len, video_names_by_set.values()))
+    split_dict = OrderedDict(
+        (which_set, dict(
+            videos=(a, b),
+            targets=(a, b)))
+        for which_set, a, b in zip(video_names_by_set.keys(),
+                                   split_boundaries[:-1],
+                                   split_boundaries[1:]))
 
-def create_hdf5(split, indir):
     f = h5py.File(os.environ["KTH_JPEG_HDF5"], "w")
-    f.create_group("video_ranges")
 
-    split_dict = {}
-    for which_set, video_names in split.items():
-        f, (a, b) = fill_hdf5(f, which_set, video_names, indir)
-        split_dict[which_set] = OrderedDict(
-            images=(a, b),
-            targets=(a, b))
+    all_video_names = list(itertools.chain(*video_names_by_set.values()))
+    n_videos = len(all_video_names)
 
-    print split_dict
+    # store all videos' frames in sequence
+    all_frames = []
+    video_boundaries = [0]
+    for i, video_name in enumerate(all_video_names):
+        globexpr = os.path.join(indir, video_name, "*.jpeg")
+        print i, indir, video_name, globexpr
+        frames = glob.glob(globexpr)
+        if not frames:
+            raise RuntimeError("no frames match %s" % globexpr)
+        frames = natural_sort(frames)[::-1]
+        all_frames.extend(frames)
+        video_boundaries.append(len(all_frames))
 
+    n_frames = len(all_frames)
+
+    f.create_dataset(
+        "frames", (n_frames,), maxshape=(None,),
+        dtype=h5py.special_dtype(vlen=np.uint8))
+    f["frames"][:] = map(load_frame, all_frames)
+
+    # we represent videos by ranges of frames
+    f.create_dataset("videos", (n_videos, 2), dtype=np.uint32)
+    f["videos"][:, :] = list(zip(video_boundaries[:-1], video_boundaries[1:]))
+
+    f.create_dataset("targets", (n_videos,), dtype=np.uint8)
+    f["targets"][:] = map(infer_target, all_video_names)
+    
     f.attrs["split"] = H5PYDataset.create_split_array(split_dict)
     f.flush()
     f.close()
 
-def fill_hdf5(f, which_set, video_names, indir):
-    # store all videos' frames in sequence
-    all_images = []
-    # replicating the target for each video across its frames makes
-    # life involving H5PYDataset much easier
-    all_targets = []
-
-    video_boundaries = [0]
-    for i, video_name in enumerate(video_names):
-        globexpr = os.path.join(indir, video_name, "*.jpeg")
-        print i, indir, video_name, globexpr
-        images = glob.glob(globexpr)
-        if not images:
-            raise RuntimeError("no images match %s" % globexpr)
-        images = natural_sort(images)[::-1]
-        all_images.extend(images)
-        all_targets.extend(len(images) * [infer_target(video_name)])
-        video_boundaries.append(len(all_images))
-
-    n_images = len(all_images)
-
-    # grow hdf5 tables
-    for key, dtype in zip("images targets".split(),
-                          (h5py.special_dtype(vlen=np.uint8), np.uint8)):
-        if key in f:
-            f[key].resize(len(f[key]) + n_images, axis=0)
-        else:
-            f.create_dataset(key, (n_images,),
-                             dtype=dtype, maxshape=(None,))
-
-    # insert data
-    f["images"][-n_images:] = list(map(load_frame, all_images))
-    f["targets"][-n_images:] = all_targets
-
-    # store videos by referring to ranges of images
-    video_ranges = f["video_ranges"].create_dataset(
-        which_set, (len(video_names), 2), dtype="uint32")
-    # note video_ranges are relative to which_set
-    video_ranges[:, :] = np.array(zip(video_boundaries[:-1], video_boundaries[1:]))
-
-    # note what range of images and targets corresponds to the subset
-    # of the data we just processed
-    a, b = len(f["images"]) - n_images, len(f["images"])
-    return f, (a, b)
-
 def load_frame(path):
-    # we store the images as jpeg and do the decompression on the fly.
+    # we store the frames as jpeg and do the decompression on the fly.
     data = StringIO()
     Image.open(path).convert("L").save(data, format="JPEG")
     data.seek(0)
