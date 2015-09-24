@@ -12,22 +12,12 @@ class JpegHDF5Dataset(fuel.datasets.H5PYDataset):
         file = h5py.File(os.environ["KTH_JPEG_HDF5"], "r")
         super(JpegHDF5Dataset, self).__init__(file, which_sets=(which_set,),
                                               load_in_memory=load_in_memory)
-        # grab only the relevant frames because we don't want to keep
-        # them all in memory three times
-        a, b = self.get_start_stop(file, "train")["videos"]
-        _, video_ranges = super(JpegHDF5Dataset, self).get_data(request=slice(a, b))
-        # ensure which_set's frames are stored contiguously; this
-        # simplifies indexing and mapping indices.
-        assert np.array_equal(video_ranges[:-1, 1], video_ranges[1:, 0])
-        self.frames = np.array(file["frames"][video_ranges[0, 0]:video_ranges[-1, 1]])
-        self.video_range_base = video_ranges[0, 0]
+        self.frames = np.array(file["frames"][which_set])
         if load_in_memory:
             file.close()
 
     def get_data(self, *args, **kwargs):
         targets, video_ranges = super(JpegHDF5Dataset, self).get_data(*args, **kwargs)
-        # account for the fact that self.frames is a subsequence
-        video_ranges -= self.video_range_base
         videos = list(map(self.video_from_jpegs, video_ranges))
         return targets, videos
 
@@ -69,5 +59,12 @@ if __name__ == "__main__":
                        (x.shape[0]*x.shape[1],
                         x.shape[2])))
     list(itertools.starmap(save_video, enumerate(zip(x, y))))
+
+    lengths = []
+    for batch in trainstream.get_epoch_iterator(as_dict=True):
+        lengths.extend(map(len, batch["videos"]))
+    import matplotlib.pyplot as plt
+    plt.hist(lengths, bins=30)
+    plt.show()
 
     import pdb; pdb.set_trace()

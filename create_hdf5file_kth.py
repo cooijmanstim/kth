@@ -10,61 +10,145 @@ import os
 import glob, re
 from StringIO import StringIO
 from fuel.datasets.hdf5 import H5PYDataset
+import urllib
+import contextlib
+
+def get_split_info():
+    def skip_blank_line(file):
+        assert not next(file).strip()
+
+    def parse_people_split(line, label):
+        match = re.match(r"^\s*%s\s*:\s*person(?P<people>[\d\s,]+)\s*$" % label, line)
+        assert match
+        people = list(map(int, match.group("people").split(",")))
+        return people
+
+    file = urllib.urlopen("http://www.nada.kth.se/cvap/actions/00sequences.txt")
+
+    while next(file).strip() != "following subdivision of sequences with respect to the subject:":
+        pass
+
+    skip_blank_line(file)
+
+    people_split = OrderedDict(
+        (which_set, parse_people_split(next(file), title))
+        for which_set, title in OrderedDict([
+                ("train", "Training"),
+                ("valid", "Validation"),
+                ("test",  "Test")]).items())
+
+    skip_blank_line(file)
+    skip_blank_line(file)
+
+    video_infos = OrderedDict(
+        (which_set, [])
+        for which_set in people_split.keys())
+
+    for line in file:
+        if not line.strip():
+            continue
+
+        match = re.match(r"^\s*(?P<video_name>person(?P<person>\d+)_"
+                         r"(?P<label>[^_]+)_d\d)\s+"
+                         r"(?:(?P<missing>[*]missing[*])|"
+                         r"frames\s+(?P<ranges>[\d\s,-]+))\s*$",
+                         line)
+        assert match
+        video_info = match.groupdict()
+        if video_info["missing"]:
+            # wth is that supposed to mean?
+            continue
+        video_info["person"] = int(video_info["person"])
+        video_info["ranges"] = list(list(map(int, ab.split("-")))
+                                    for ab in video_info["ranges"].split(","))
+        which_set = next(which_set for which_set, people in people_split.items()
+                            if video_info["person"] in people)
+        video_infos[which_set].append(video_info)
+        
+    file.close()
+
+    return video_infos
+
+targets_by_label = dict(
+    (label, target) for target, label in
+    enumerate("boxing handclapping handwaving jogging running walking".split()))
 
 def main():
-    if (len(sys.argv) != 3):
-        print("%s: annotdir indir" % sys.argv[0])
+    if (len(sys.argv) != 2):
+        # indir is assumed to have each video's frames layed out like:
+        # [cooijmat@bart13 frames]$ find .
+        # ./person25_running_d2_uncomp
+        # ./person25_running_d2_uncomp/image-1.jpeg
+        # ./person25_running_d2_uncomp/image-2.jpeg
+        # ./person25_running_d2_uncomp/image-3.jpeg
+        # [...]
+        # ./person02_handclapping_d4_uncomp
+        # ./person02_handclapping_d4_uncomp/image-1.jpeg
+        # ./person02_handclapping_d4_uncomp/image-2.jpeg
+        # ./person02_handclapping_d4_uncomp/image-3.jpeg
+        # [...]
+        # and so on.
+        print("Usage: %s indir" % sys.argv[0])
         sys.exit(1)
 
-    annotdir = sys.argv[1]
-    indir = sys.argv[2]
-
-    video_names_by_set = OrderedDict(
-        (which_set, 
-         read_list(os.path.join(annotdir, "%s.txt" % which_set)))
-        for which_set in "train valid test".split())
-
-    split_boundaries = [0] + list(map(len, video_names_by_set.values()))
-    split_dict = OrderedDict(
-        (which_set, dict(
-            videos=(a, b),
-            targets=(a, b)))
-        for which_set, a, b in zip(video_names_by_set.keys(),
-                                   split_boundaries[:-1],
-                                   split_boundaries[1:]))
+    video_infos_by_set = get_split_info()
+    indir = sys.argv[1]
 
     f = h5py.File(os.environ["KTH_JPEG_HDF5"], "w")
 
-    all_video_names = list(itertools.chain(*video_names_by_set.values()))
-    n_videos = len(all_video_names)
+    n_examples = sum(len(video_info["ranges"]) for video_info in
+                     itertools.chain.from_iterable(video_infos_by_set.values()))
 
-    # store all videos' frames in sequence
-    all_frames = []
-    video_boundaries = [0]
-    for i, video_name in enumerate(all_video_names):
-        globexpr = os.path.join(indir, video_name, "*.jpeg")
-        print i, indir, video_name, globexpr
-        frames = glob.glob(globexpr)
-        if not frames:
-            raise RuntimeError("no frames match %s" % globexpr)
-        frames = natural_sort(frames)[::-1]
-        all_frames.extend(frames)
-        video_boundaries.append(len(all_frames))
-
-    n_frames = len(all_frames)
-
-    f.create_dataset(
-        "frames", (n_frames,), maxshape=(None,),
-        dtype=h5py.special_dtype(vlen=np.uint8))
-    f["frames"][:] = map(load_frame, all_frames)
+    # frames are stored in one contiguous table for each subset
+    f.create_group("frames")
 
     # we represent videos by ranges of frames
-    f.create_dataset("videos", (n_videos, 2), dtype=np.uint32)
-    f["videos"][:, :] = list(zip(video_boundaries[:-1], video_boundaries[1:]))
+    f.create_dataset("videos", (n_examples, 2), dtype=np.uint32)
+    f.create_dataset("targets", (n_examples,), dtype=np.uint8)
 
-    f.create_dataset("targets", (n_videos,), dtype=np.uint8)
-    f["targets"][:] = map(infer_target, all_video_names)
-    
+    split_dict = OrderedDict()
+
+    split_stop = 0
+    for which_set, video_infos in video_infos_by_set.items():
+        frame_paths = []
+        videos = []
+        targets = []
+
+        for video_info in video_infos:
+            print which_set, video_info
+
+            # this one video just doesn't have that many frames
+            if video_info["video_name"] == "person01_boxing_d4":
+                video_info["ranges"][-1][1] = 304
+
+            for a, b in video_info["ranges"]:
+                # the ranges in 00sequences.txt are meant to be inclusive
+                b += 1
+
+                # store videos as ranges of frames[which_set]
+                videos.append((len(frame_paths), len(frame_paths) + b - a))
+                # target is the same for each segment of the video
+                targets.append(targets_by_label[video_info["label"]])
+
+                frame_path = os.path.join(
+                    indir,
+                    video_info["video_name"] + "_uncomp",
+                    "image-") + "{}.jpeg"
+                frame_paths.extend(map(frame_path.format, xrange(a, b)))
+
+        f["frames"].create_dataset(
+            which_set, (len(frame_paths),), maxshape=(None,),
+            dtype=h5py.special_dtype(vlen=np.uint8))
+        f["frames"][which_set][:] = map(load_frame, frame_paths)
+
+        split_start, split_stop = split_stop, split_stop + len(targets)
+        f["videos" ][split_start:split_stop] = videos
+        f["targets"][split_start:split_stop] = targets
+
+        split_dict[which_set] = OrderedDict([
+            ("videos",  (split_start, split_stop)),
+            ("targets", (split_start, split_stop))])
+
     f.attrs["split"] = H5PYDataset.create_split_array(split_dict)
     f.flush()
     f.close()
@@ -75,31 +159,6 @@ def load_frame(path):
     Image.open(path).convert("L").save(data, format="JPEG")
     data.seek(0)
     return np.fromstring(data.read(), dtype="uint8")
-
-labels = dict(
-    (label, code) for code, label in
-    enumerate("boxing handclapping handwaving jogging running walking".split()))
-def infer_target(video_name):
-    key = video_name.split("_")[1]
-    return labels[key]
-
-def read_list(filename):
-    with open(filename) as fp:
-        return list(map(operator.methodcaller("strip"), fp))
-
-def natural_sort(xs):
-    def tryint(s):
-        try:
-            return int(s)
-        except:
-            return s
-    def alphanum_key(s):
-        """ Turn a string into a list of string and number chunks.
-        "z23a" -> ["z", 23, "a"]
-        """
-        return list(map(tryint, re.split("(\-?[0-9]+)", s)))
-    xs.sort(key=alphanum_key)
-    return xs
 
 if __name__ == "__main__":
     main()
